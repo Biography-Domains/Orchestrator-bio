@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Any, Dict, Optional
 
 import requests
@@ -94,30 +95,39 @@ def _neon_get(path: str, api_key: str) -> Dict[str, Any]:
 
 
 def provision_neon_project(*, api_key: str, name: str) -> NeonProvisionResult:
-    # Create project (Neon creates a default branch, db, role, and endpoint)
-    created = _neon_post(
-        "/projects",
-        api_key,
-        {
-            "project": {
-                "name": name,
-                # keep defaults for region/pg_version unless env provides override
-            }
-        },
-    )
-    proj = created.get("project") or {}
-    project_id = proj.get("id") or ""
-    if not project_id:
-        raise RuntimeError(f"Neon create project returned no id: {created}")
+    # Prefer reusing an existing project by name to avoid creating duplicates.
+    existing = _neon_get("/projects", api_key)
+    projects = existing.get("projects") or []
+    proj = next((p for p in projects if (p.get("name") or "").strip().lower() == name.strip().lower()), None)
 
-    # Try to read defaults from the response
+    created: Dict[str, Any] = {}
+    if not proj:
+        created = _neon_post(
+            "/projects",
+            api_key,
+            {"project": {"name": name}},
+        )
+        proj = created.get("project") or {}
+
+    project_id = (proj.get("id") or "").strip()
+    if not project_id:
+        raise RuntimeError(f"Neon project id missing: {proj}")
+
+    # Determine defaults from create response when available; otherwise fall back to listing.
     databases = created.get("databases") or []
     roles = created.get("roles") or []
     branch = (created.get("branch") or {}) if isinstance(created.get("branch"), dict) else {}
-
-    db_name = (databases[0].get("name") if databases else "orchestrator_bio") or "orchestrator_bio"
-    role_name = (roles[0].get("name") if roles else "orchestrator_bio") or "orchestrator_bio"
     branch_id = branch.get("id")
+
+    if not databases:
+        dbs = _neon_get(f"/projects/{project_id}/databases", api_key).get("databases") or []
+        databases = dbs
+    if not roles:
+        rs = _neon_get(f"/projects/{project_id}/roles", api_key).get("roles") or []
+        roles = rs
+
+    db_name = (databases[0].get("name") if databases else "neondb") or "neondb"
+    role_name = (roles[0].get("name") if roles else "neondb_owner") or "neondb_owner"
 
     # Connection URI endpoint varies; try official helper endpoint first.
     # Neon docs use /projects/{id}/connection_uri with database_name + role_name.
@@ -140,6 +150,22 @@ def provision_neon_project(*, api_key: str, name: str) -> NeonProvisionResult:
             raise
         # User/password are not retrievable; this fallback is best-effort only.
         raise RuntimeError("Could not retrieve Neon connection URI automatically; check Neon API response.")
+
+    # Store async SQLAlchemy-compatible URL by default.
+    if uri.startswith("postgresql://"):
+        uri = uri.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Convert libpq-style params to asyncpg-friendly params.
+    try:
+        parts = urlsplit(uri)
+        q_in = list(parse_qsl(parts.query, keep_blank_values=True))
+        q = [(k, v) for (k, v) in q_in if k not in {"channel_binding", "sslmode"}]
+        if not any(k == "ssl" for (k, _v) in q):
+            q.append(("ssl", "require"))
+        else:
+            q = [(k, ("require" if k == "ssl" and v.lower() == "true" else v)) for (k, v) in q]
+        uri = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+    except Exception:
+        pass
 
     return NeonProvisionResult(
         project_id=project_id,
