@@ -19,4 +19,12 @@ uvicorn services.orchestrator_bio_api.main:app --reload --port 8030
 uvicorn services.hyperlink_bio_api.main:app --reload --port 8020
 ```
 
+## Provision Neon Postgres (ops)
+
+This repo uses a shared Postgres DB on Neon. Provision it and store the URL in GCP Secret Manager:
+
+```bash
+python scripts/provision_neon_db.py --project superapp-466313
+```
+
 
